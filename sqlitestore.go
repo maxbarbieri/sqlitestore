@@ -1,4 +1,4 @@
-/* Gorilla Sessions backend for MySQL.
+/* Gorilla Sessions backend for SQLite.
 
 Copyright (c) 2013 Contributors. See the list of contributors in the CONTRIBUTORS file for details.
 
@@ -31,6 +31,9 @@ type SqliteStore struct {
 	Codecs  []securecookie.Codec
 	Options *sessions.Options
 	table   string
+
+	//callback which gets called for each session before it is deleted for inactivity
+	expiredSessionPreDeleteCallback func(*sessions.Session)
 }
 
 type sessionRow struct {
@@ -42,7 +45,7 @@ type sessionRow struct {
 }
 
 type DB interface {
-	Exec(query string, args ...interface{}) (sql.Result, error) 
+	Exec(query string, args ...interface{}) (sql.Result, error)
 	Prepare(query string) (*sql.Stmt, error)
 	Close() error
 }
@@ -51,16 +54,16 @@ func init() {
 	gob.Register(time.Time{})
 }
 
-func NewSqliteStore(endpoint string, tableName string, path string, maxAge int, keyPairs ...[]byte) (*SqliteStore, error) {
+func NewSqliteStore(endpoint string, tableName string, sessionsOptions sessions.Options, keyPairs ...[]byte) (*SqliteStore, error) {
 	db, err := sql.Open("sqlite3", endpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewSqliteStoreFromConnection(db, tableName, path, maxAge, keyPairs...)
+	return NewSqliteStoreFromConnection(db, tableName, sessionsOptions, keyPairs...)
 }
 
-func NewSqliteStoreFromConnection(db DB, tableName string, path string, maxAge int, keyPairs ...[]byte) (*SqliteStore, error) {
+func NewSqliteStoreFromConnection(db DB, tableName string, sessionsOptions sessions.Options, keyPairs ...[]byte) (*SqliteStore, error) {
 	// Make sure table name is enclosed.
 	tableName = "`" + strings.Trim(tableName, "`") + "`"
 
@@ -87,15 +90,13 @@ func NewSqliteStoreFromConnection(db DB, tableName string, path string, maxAge i
 		return nil, stmtErr
 	}
 
-	updQ := "UPDATE " + tableName + " SET session_data = ?, created_on = ?, expires_on = ? " +
-		"WHERE id = ?"
+	updQ := "UPDATE " + tableName + " SET session_data = ?, created_on = ?, expires_on = ? WHERE id = ?"
 	stmtUpdate, stmtErr := db.Prepare(updQ)
 	if stmtErr != nil {
 		return nil, stmtErr
 	}
 
-	selQ := "SELECT id, session_data, created_on, modified_on, expires_on from " +
-		tableName + " WHERE id = ?"
+	selQ := "SELECT id, session_data, created_on, modified_on, expires_on from " + tableName + " WHERE id = ?"
 	stmtSelect, stmtErr := db.Prepare(selQ)
 	if stmtErr != nil {
 		return nil, stmtErr
@@ -109,8 +110,12 @@ func NewSqliteStoreFromConnection(db DB, tableName string, path string, maxAge i
 		stmtSelect: stmtSelect,
 		Codecs:     securecookie.CodecsFromPairs(keyPairs...),
 		Options: &sessions.Options{
-			Path:   path,
-			MaxAge: maxAge,
+			Path:     sessionsOptions.Path,
+			MaxAge:   sessionsOptions.MaxAge,
+			Domain:   sessionsOptions.Domain,
+			Secure:   sessionsOptions.Secure,
+			HttpOnly: sessionsOptions.HttpOnly,
+			SameSite: sessionsOptions.SameSite,
 		},
 		table: tableName,
 	}, nil
@@ -125,21 +130,32 @@ func (m *SqliteStore) Close() {
 }
 
 func (m *SqliteStore) Get(r *http.Request, name string) (*sessions.Session, error) {
-	return sessions.GetRegistry(r).Get(m, name)
+	session, err := sessions.GetRegistry(r).Get(m, name)
+	if err != nil {
+		return nil, err
+	}
+
+	//use store options for sessions
+	session.Options = &sessions.Options{
+		Path:     m.Options.Path,
+		MaxAge:   m.Options.MaxAge,
+		HttpOnly: m.Options.HttpOnly,
+		Secure:   m.Options.Secure,
+		Domain:   m.Options.Domain,
+		SameSite: m.Options.SameSite,
+	}
+
+	return session, nil
 }
 
 func (m *SqliteStore) New(r *http.Request, name string) (*sessions.Session, error) {
 	session := sessions.NewSession(m, name)
-	session.Options = &sessions.Options{
-		Path:   m.Options.Path,
-		MaxAge: m.Options.MaxAge,
-	}
 	session.IsNew = true
 	var err error
 	if cook, errCookie := r.Cookie(name); errCookie == nil {
 		err = securecookie.DecodeMulti(name, cook.Value, &session.ID, m.Codecs...)
 		if err == nil {
-			err = m.load(session)
+			err = m.load(session, false)
 			if err == nil {
 				session.IsNew = false
 			} else {
@@ -205,7 +221,6 @@ func (m *SqliteStore) insert(session *sessions.Session) error {
 }
 
 func (m *SqliteStore) Delete(r *http.Request, w http.ResponseWriter, session *sessions.Session) error {
-
 	// Set cookie to expire.
 	options := *session.Options
 	options.MaxAge = -1
@@ -238,7 +253,6 @@ func (m *SqliteStore) save(session *sessions.Session) error {
 	exOn := session.Values["expires_on"]
 	if exOn == nil {
 		expiresOn = time.Now().Add(time.Second * time.Duration(session.Options.MaxAge))
-		log.Print("nil")
 	} else {
 		expiresOn = exOn.(time.Time)
 		if expiresOn.Sub(time.Now().Add(time.Second*time.Duration(session.Options.MaxAge))) < 0 {
@@ -260,14 +274,14 @@ func (m *SqliteStore) save(session *sessions.Session) error {
 	return nil
 }
 
-func (m *SqliteStore) load(session *sessions.Session) error {
+func (m *SqliteStore) load(session *sessions.Session, loadEvenIfExpired bool) error {
 	row := m.stmtSelect.QueryRow(session.ID)
 	sess := sessionRow{}
 	scanErr := row.Scan(&sess.id, &sess.data, &sess.createdOn, &sess.modifiedOn, &sess.expiresOn)
 	if scanErr != nil {
 		return scanErr
 	}
-	if sess.expiresOn.Sub(time.Now()) < 0 {
+	if sess.expiresOn.Sub(time.Now()) < 0 && !loadEvenIfExpired {
 		log.Printf("Session expired on %s, but it is %s now.", sess.expiresOn, time.Now())
 		return errors.New("Session expired")
 	}
@@ -279,5 +293,4 @@ func (m *SqliteStore) load(session *sessions.Session) error {
 	session.Values["modified_on"] = sess.modifiedOn
 	session.Values["expires_on"] = sess.expiresOn
 	return nil
-
 }
