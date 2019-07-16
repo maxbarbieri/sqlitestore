@@ -237,6 +237,11 @@ func (m *SqliteStore) Delete(r *http.Request, w http.ResponseWriter, session *se
 	return nil
 }
 
+func (m *SqliteStore) DeleteFromDatabaseSessionWithID(sessionID string) (err error) {
+	_, err = m.stmtDelete.Exec(sessionID)
+	return
+}
+
 func (m *SqliteStore) save(session *sessions.Session) error {
 	if session.IsNew == true {
 		return m.insert(session)
